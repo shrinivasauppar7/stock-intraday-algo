@@ -133,7 +133,19 @@ public class DualEntryTradingService {
         try {
             gateStatusService.initGatesPending(symbol);
 
-            double ltp = fetchLtp(symbol);
+            // FIX (per explicit user report - confirmed real price-
+            // source inconsistency): use the SAME live WebSocket-fed
+            // price cache that signal detection (evaluateBreakout)
+            // already uses, instead of a separate REST getQuote() call.
+            // Without this, a signal could genuinely trigger on live
+            // price breaking the level, only for Gate 1 to immediately
+            // fail because its OWN, separately-fetched REST price
+            // hadn't caught up yet - two different price sources within
+            // the same trade attempt. Falls back to the REST fetch only
+            // if no live price is cached yet for this symbol.
+            var livePrices = marketDataService.getLastPricesSimple();
+            double ltp = livePrices.containsKey(symbol)
+                    ? livePrices.get(symbol).doubleValue() : fetchLtp(symbol);
             if (ltp <= 0) throw new DualEntryStrategyException("Could not fetch valid live price for " + symbol);
             double entry = isLong ? ltp * 1.0005 : ltp * 0.9995;
 
