@@ -68,19 +68,6 @@ public class MomentumTradingService {
     // needed to read live market depth captured from the WebSocket
     // FULL-mode tick stream (fetchLtp's REST getQuote() call does not
     // carry depth - depth only flows through the WebSocket).
-    private final com.trading.marketdata.service.MarketDataService marketDataService;
-    // ADDITIVE (Institutional Confluence Engine integration, per
-    // explicit user request): new dependency, does not remove or
-    // alter any existing one.
-    private final com.trading.institutional.service.ConfluenceValidationService confluenceService;
-    // FIX (duplicate order-book evaluation, per explicit user request):
-    // the inline gate below and the Confluence Engine were each
-    // independently re-computing the exact same order-book analysis
-    // from the same depth history. This is the SAME algorithm,
-    // already verified byte-identical to the inline version - used now
-    // to compute the result ONCE, reused by both the hard-gate check
-    // and the Confluence Engine.
-    private final com.trading.institutional.service.OrderBookConfirmationService orderBookService;
     // ADDITIVE (dashboard gate-visibility feature, per explicit user
     // request): records entry-gate pass/fail results for dashboard
     // display - never makes any decision itself.
@@ -92,9 +79,6 @@ public class MomentumTradingService {
                                   CrossStrategyPositionRegistry positionRegistry,
                                   com.trading.momentumstockofday.repository.MomentumCapitalRepository capitalRepository,
                                   MomentumCandleService candleService,
-                                  com.trading.marketdata.service.MarketDataService marketDataService,
-                                  com.trading.institutional.service.ConfluenceValidationService confluenceService,
-                                  com.trading.institutional.service.OrderBookConfirmationService orderBookService,
                                   MomentumGateStatusService gateStatusService) {
         this.kiteConnect = kiteConnect;
         this.config = config;
@@ -103,9 +87,6 @@ public class MomentumTradingService {
         this.positionRegistry = positionRegistry;
         this.capitalRepository = capitalRepository;
         this.candleService = candleService;
-        this.marketDataService = marketDataService;
-        this.confluenceService = confluenceService;
-        this.orderBookService = orderBookService;
         this.gateStatusService = gateStatusService;
     }
 
@@ -455,88 +436,6 @@ public class MomentumTradingService {
                         Math.abs(freshLtp - entry), riskPerShare));
             }
             gateStatusService.record(symbol, "FRESH_PRICE_CHECK", true, "Price has not reversed meaningfully");
-
-            // ═══════════════════════════════════════════════════════════
-            // ORDER BOOK CONFIRMATION (per explicit user request - FIX,
-            // duplicate evaluation eliminated): this used to be ~115
-            // lines of inline logic here, ALSO independently
-            // re-implemented a second time inside the Confluence
-            // Engine's own OrderBookConfirmationService - both computing
-            // the identical analysis from the same depth history. Now
-            // computed ONCE via the standalone service (verified
-            // byte-identical thresholds to the original inline version:
-            // ratio>=1.30, OBI>=|0.15|, best-bid/ask, wall detection,
-            // 3-consecutive-update persistence, spoofing heuristic).
-            // ENFORCEMENT UNCHANGED: this remains a hard, ALWAYS-ON gate
-            // (outside the log-only Confluence block below) - throws
-            // exactly as before if it fails. The result is reused by
-            // the Confluence Engine immediately after, instead of being
-            // computed a second time.
-            // ═══════════════════════════════════════════════════════════
-            var ob = orderBookService.validate(symbol, direction);
-            if (ob.spoofDetected()) {
-                gateStatusService.record(symbol, "ORDER_BOOK_GATE", false, "Possible spoofing detected");
-                throw new MomentumStrategyException(symbol + " - order-book gate: possible spoofing " +
-                        "detected (a price level spiked then collapsed within the sampling window) - " +
-                        "rejecting rather than trading on unreliable order-flow signal");
-            }
-            if (!ob.pass()) {
-                gateStatusService.record(symbol, "ORDER_BOOK_GATE", false, ob.reasonCodes().toString());
-                throw new MomentumStrategyException(String.format(
-                        "%s - order-book gate REJECTED: %s", symbol, ob.reasonCodes()));
-            }
-            gateStatusService.record(symbol, "ORDER_BOOK_GATE", true,
-                    "score=" + ob.confidenceScore() + "/25: " + ob.reasonCodes());
-            log.info("[MOMENTUM-TRADE] {} order-book gate PASSED (score={}/25): {}", symbol,
-                    ob.confidenceScore(), ob.reasonCodes());
-
-            // ═══════════════════════════════════════════════════════════
-            // INSTITUTIONAL CONFLUENCE ENGINE (per explicit user request,
-            // additive integration): Volume Profile + Order Flow +
-            // Order Book (result reused from above, not recomputed),
-            // checked AFTER the existing order-book gate above (which
-            // remains independently enforced). This engine NEVER
-            // generates a trade - it can only VETO one the existing
-            // pipeline already approved, exactly like the order-book
-            // gate's own role. FIX (stale comment corrected during a
-            // line-by-line validation pass): this previously said
-            // "LOG-ONLY by default... before you decide to make it
-            // live" - but confluenceEngineLogOnly was explicitly set to
-            // LIVE per user decision. This is now a HARD, ENFORCING gate
-            // (pure AND-based, no scoring) - a failure here throws and
-            // blocks the trade, exactly like every other gate above it.
-            // ═══════════════════════════════════════════════════════════
-            if (config.isConfluenceEngineEnabled()) {
-                List<Long> recentVols = candleService.getRecentCandleVolumes(symbol, 6);
-                long breakoutCandleVolume = recentVols.isEmpty() ? 0 : recentVols.get(recentVols.size() - 1);
-                List<Long> priorFiveVols = recentVols.size() > 1
-                        ? recentVols.subList(0, recentVols.size() - 1) : List.of();
-                var confluence = confluenceService.validate(symbol, direction, entry,
-                        priorFiveVols, breakoutCandleVolume, ob);
-                // ADDITIVE (dashboard gate-visibility): records the two
-                // sub-module results the Confluence Engine already
-                // computed - zero change to its own decision logic.
-                gateStatusService.record(symbol, "VOLUME_PROFILE_GATE",
-                        confluence.volumeProfile().pass(), confluence.volumeProfile().reasonCodes().toString());
-                boolean orderFlowDirectionConfirmed = isLong
-                        ? confluence.orderFlow().dominance() == com.trading.institutional.service.OrderFlowConfirmationService.Dominance.BUYERS_DOMINANT
-                        : confluence.orderFlow().dominance() == com.trading.institutional.service.OrderFlowConfirmationService.Dominance.SELLERS_DOMINANT;
-                gateStatusService.record(symbol, "ORDER_FLOW_GATE", orderFlowDirectionConfirmed,
-                        "dominance=" + confluence.orderFlow().dominance() + " " + confluence.orderFlow().reasonCodes());
-                if (config.isConfluenceEngineLogOnly()) {
-                    log.info("[MOMENTUM-TRADE] {} CONFLUENCE-ENGINE (LOG-ONLY, not blocking): " +
-                                    "executeAllowed={} failReasons={}", symbol,
-                            confluence.executeAllowed(), confluence.failReasons());
-                } else if (!confluence.executeAllowed()) {
-                    throw new MomentumStrategyException(String.format(
-                            "%s - Institutional Confluence Engine REJECTED (hard-gate): failReasons=%s " +
-                                    "- existing gates approved this trade but institutional confirmation did " +
-                                    "not, skipping", symbol, confluence.failReasons()));
-                } else {
-                    log.info("[MOMENTUM-TRADE] {} CONFLUENCE-ENGINE PASSED (all hard gates cleared)",
-                            symbol);
-                }
-            }
 
             String orderId = placeMarketOrder(symbol, isLong ? Constants.TRANSACTION_TYPE_BUY
                     : Constants.TRANSACTION_TYPE_SELL, qty);
