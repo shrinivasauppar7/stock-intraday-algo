@@ -80,7 +80,7 @@ public class MomentumGateStatusService {
     public static final String[] ENTRY_GATE_NAMES = {
             "STRUCTURAL_RISK", "SKIP_RULE_TIER_CEILING", "NOISE_FLOOR", "POSITION_SIZING",
             "MARGIN_CHECK", "TREND_FILTER", "DAILY_SR_GATE", "THIRTY_MIN_SR_GATE",
-            "FRESH_PRICE_CHECK", "ORDER_BOOK_GATE", "VOLUME_PROFILE_GATE", "ORDER_FLOW_GATE"
+            "FRESH_PRICE_CHECK"
     };
 
     /** Full snapshot for the dashboard - symbol -> ordered gate map
